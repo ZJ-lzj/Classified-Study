@@ -1,0 +1,662 @@
+# ============================================================
+# Earthquake / Explosion Classification
+# SVM with Hand-crafted Features (5-Fold CV)
+# - 278 raw events → 5-fold stratified CV (Event-level split)
+# - Train: sliding window augmentation + feature extraction
+# - Test: center window only + feature extraction
+# - Per-fold GridSearchCV + SVM → Per-fold optimal threshold → Evaluation
+# - Unknown prediction via 5-fold ensemble
+# ============================================================
+
+import os
+import random
+import obspy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_curve,
+    auc,
+    f1_score,
+    accuracy_score,
+)
+from sklearn.inspection import permutation_importance
+from scipy import stats
+from scipy.fft import fft, fftfreq
+
+# ============================================================
+# Fixed Random Seed
+# ============================================================
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+# ============================================================
+# Paths
+# ============================================================
+WAVE_FOLDER = r"C:\Users\adminstor\OneDrive\桌面\files data"
+LABEL_XLSX  = r"C:\Users\adminstor\OneDrive\桌面\data.xlsx"
+OUTPUT_FOLDER = os.path.join(WAVE_FOLDER, "Results_SVM_5Fold")
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ============================================================
+# Hyper Parameters (Fixed FS = 100 Hz for HHZ channel)
+# ============================================================
+FIXED_FS     = 100.0
+FIXED_LEN    = 1500
+BANDPASS_MIN = 2.0
+BANDPASS_MAX = 18.0
+
+WINDOW_LEN      = 1200
+WINDOW_OFFSETS   = [-200, -100, 0, 100, 200]
+N_FOLDS = 5
+
+# ============================================================
+# Wave Normalization
+# ============================================================
+def normalize_wave(x):
+    x = x.astype(np.float32)
+    return (x - np.mean(x)) / (np.std(x) + 1e-8)
+
+# ============================================================
+# Energy Alignment
+# ============================================================
+def align_wave(data):
+    energy = data ** 2
+    smooth = np.convolve(energy, np.ones(80), mode='same')
+    peak = np.argmax(smooth)
+    start = peak - FIXED_LEN // 2
+    end   = start + FIXED_LEN
+    if start < 0:
+        start = 0; end = FIXED_LEN
+    if end > len(data):
+        end = len(data); start = max(0, end - FIXED_LEN)
+    out = data[start:end]
+    if len(out) < FIXED_LEN:
+        out = np.pad(out, (0, FIXED_LEN - len(out)), mode='constant')
+    return out
+
+# ============================================================
+# Wave Processing
+# ============================================================
+def process_wave(path):
+    st = obspy.read(path)
+    tr = st[0]
+    tr.detrend("demean")
+    tr.detrend("linear")
+    tr.filter("bandpass", freqmin=BANDPASS_MIN, freqmax=BANDPASS_MAX,
+              corners=4, zerophase=True)
+    data = tr.data.astype(np.float32)
+    data = align_wave(data)
+    data = normalize_wave(data)
+    return data
+
+# ============================================================
+# Sliding Windows (Multiple offsets → Train Augmentation)
+# ============================================================
+def sliding_windows(wave):
+    windows = []
+    energy = wave ** 2
+    smooth = np.convolve(energy, np.ones(80), mode='same')
+    peak = np.argmax(smooth)
+    center_start = peak - WINDOW_LEN // 2
+    for off in WINDOW_OFFSETS:
+        start = center_start + off
+        end   = start + WINDOW_LEN
+        if start < 0:
+            start = 0; end = WINDOW_LEN
+        if end > len(wave):
+            end = len(wave); start = max(0, end - WINDOW_LEN)
+        seg = wave[start:end]
+        if len(seg) < WINDOW_LEN:
+            seg = np.pad(seg, (0, WINDOW_LEN - len(seg)), mode='constant')
+        seg = np.interp(np.linspace(0, len(seg)-1, FIXED_LEN),
+                        np.arange(len(seg)), seg)
+        seg = normalize_wave(seg)
+        windows.append(seg.astype(np.float32))
+    return windows
+
+# ============================================================
+# Center Window Only (For Test & Unknown)
+# ============================================================
+def center_window(wave):
+    energy = wave ** 2
+    smooth = np.convolve(energy, np.ones(80), mode='same')
+    peak = np.argmax(smooth)
+    center_start = peak - WINDOW_LEN // 2
+    start = center_start
+    end   = start + WINDOW_LEN
+    if start < 0:
+        start = 0; end = WINDOW_LEN
+    if end > len(wave):
+        end = len(wave); start = max(0, end - WINDOW_LEN)
+    seg = wave[start:end]
+    if len(seg) < WINDOW_LEN:
+        seg = np.pad(seg, (0, WINDOW_LEN - len(seg)), mode='constant')
+    seg = np.interp(np.linspace(0, len(seg)-1, FIXED_LEN),
+                    np.arange(len(seg)), seg)
+    seg = normalize_wave(seg)
+    return seg.astype(np.float32)
+
+# ============================================================
+# Augmentation helpers
+# ============================================================
+def augment_wave_light(w):
+    aug = w.copy()
+    noise_std = np.random.uniform(0.001, 0.008)
+    aug += np.random.normal(0, noise_std, size=aug.shape)
+    shift = np.random.randint(-20, 20)
+    aug = np.roll(aug, shift)
+    aug = normalize_wave(aug)
+    return aug.astype(np.float32)
+
+def augment_wave_amplitude_shift(w):
+    aug = w.copy()
+    baseline = np.random.uniform(-0.3, 0.3)
+    aug += baseline
+    amp = np.random.uniform(0.8, 1.2)
+    aug *= amp
+    aug = normalize_wave(aug)
+    return aug.astype(np.float32)
+
+# ============================================================
+# Feature Extraction (Tailored for 100 Hz - 44 dims)
+# ============================================================
+def extract_features(wave, fs=100.0):
+    wave = wave.astype(np.float64)
+    feats = []
+
+    # ---------- Time Domain (21 features) ----------
+    mean_val   = np.mean(wave)
+    std_val    = np.std(wave)
+    skew_val   = stats.skew(wave)
+    kurt_val   = stats.kurtosis(wave)
+    max_val    = np.max(wave)
+    min_val    = np.min(wave)
+    range_val  = max_val - min_val
+    rms_val    = np.sqrt(np.mean(wave**2))
+
+    zero_cross = np.sum(np.diff(np.sign(wave)) != 0)
+    zcr        = zero_cross / len(wave)
+
+    ptp            = np.ptp(wave)
+    crest_factor   = max_val / (rms_val + 1e-8)
+    shape_factor   = rms_val / (np.mean(np.abs(wave)) + 1e-8)
+    impulse_factor = max_val / (np.mean(np.abs(wave)) + 1e-8)
+    clearance      = max_val / ((np.mean(np.sqrt(np.abs(wave)))**2) + 1e-8)
+
+    energy = np.sum(wave**2)
+
+    prob = np.abs(wave) / (np.sum(np.abs(wave)) + 1e-8)
+    prob = prob[prob > 0]
+    entropy = -np.sum(prob * np.log2(prob + 1e-12))
+
+    p25 = np.percentile(wave, 25)
+    p50 = np.percentile(wave, 50)
+    p75 = np.percentile(wave, 75)
+    iqr = p75 - p25
+    mad = np.median(np.abs(wave - np.median(wave)))
+
+    feats.extend([
+        mean_val, std_val, skew_val, kurt_val,
+        max_val, min_val, range_val, rms_val,
+        zcr, ptp, crest_factor, shape_factor,
+        impulse_factor, clearance, energy, entropy,
+        p25, p50, p75, iqr, mad
+    ])
+
+    # ---------- Frequency Domain (10 features) ----------
+    N  = len(wave)
+    yf = fft(wave)
+    xf = fftfreq(N, 1.0 / fs)
+    power_spec = np.abs(yf[:N//2])**2
+    freqs      = xf[:N//2]
+    total_power = np.sum(power_spec) + 1e-8
+
+    dominant_freq    = freqs[np.argmax(power_spec)]
+    spectral_centroid = np.sum(freqs * power_spec) / total_power
+    spectral_spread  = np.sqrt(np.sum(((freqs - spectral_centroid)**2) * power_spec) / total_power)
+    mean_freq        = np.sum(freqs * power_spec) / total_power
+    spectral_energy  = np.sum(power_spec)
+
+    pn = power_spec / total_power
+    pn = pn[pn > 0]
+    spectral_entropy = -np.sum(pn * np.log2(pn + 1e-12))
+
+    cumsum = np.cumsum(power_spec)
+    rolloff_idx = np.searchsorted(cumsum, 0.85 * total_power)
+    spectral_rolloff = freqs[min(rolloff_idx, len(freqs)-1)]
+
+    geom_mean = np.exp(np.mean(np.log(power_spec + 1e-12)))
+    arith_mean = np.mean(power_spec) + 1e-8
+    spectral_flatness = geom_mean / arith_mean
+
+    spectral_skew = stats.skew(power_spec)
+    spectral_kurt = stats.kurtosis(power_spec)
+
+    feats.extend([
+        dominant_freq, spectral_centroid, spectral_spread,
+        mean_freq, spectral_energy, spectral_entropy,
+        spectral_rolloff, spectral_flatness,
+        spectral_skew, spectral_kurt
+    ])
+
+    # ---------- Bandpower (8 features) ----------
+    band_edges = [0, 2, 5, 8, 12, 18, 25, 35, 50]
+    for i in range(len(band_edges)-1):
+        mask = (freqs >= band_edges[i]) & (freqs < band_edges[i+1])
+        feats.append(np.sum(power_spec[mask]))
+
+    # ---------- Auxiliary (5 features) ----------
+    for lag in [10, 50, 100, 200]:
+        if lag < len(wave):
+            feats.append(np.corrcoef(wave[:-lag], wave[lag:])[0, 1])
+        else:
+            feats.append(0.0)
+
+    peak_region  = wave[N//2-100 : N//2+100]
+    quiet_region = wave[:200]
+    snr = np.std(peak_region) / (np.std(quiet_region) + 1e-8)
+    feats.append(snr)
+
+    return np.array(feats, dtype=np.float64)
+
+# ============================================================
+# Feature names (44 total)
+# ============================================================
+def get_feature_names():
+    names = [
+        'mean','std','skewness','kurtosis',
+        'max','min','range','rms',
+        'zcr','ptp','crest_factor','shape_factor',
+        'impulse_factor','clearance_factor','energy','entropy',
+        'p25','p50','p75','iqr','mad',
+        'dominant_freq','spectral_centroid','spectral_spread',
+        'mean_freq','spectral_energy','spectral_entropy',
+        'spectral_rolloff','spectral_flatness',
+        'spectral_skew','spectral_kurt'
+    ]
+    band_edges = [0, 2, 5, 8, 12, 18, 25, 35, 50]
+    for i in range(len(band_edges)-1):
+        names.append(f'bandpower_{band_edges[i]}_{band_edges[i+1]}Hz')
+    for lag in [10, 50, 100, 200]:
+        names.append(f'autocorr_lag{lag}')
+    names.append('snr')
+    return names
+
+# ============================================================
+# Load Labels & Waveform Data
+# ============================================================
+df = pd.read_excel(LABEL_XLSX)
+df["filename"] = df["filename"].astype(str).str.strip().str.lower()
+df["label"]    = pd.to_numeric(df["label"], errors="coerce")
+
+X_wave, y = [], []
+X_unknown, unknown_names = [], []
+
+files = [f for f in os.listdir(WAVE_FOLDER) if f.endswith(".mseed")]
+print(f"Total files = {len(files)}")
+
+for f in files:
+    path = os.path.join(WAVE_FOLDER, f)
+    try:
+        wave = process_wave(path)
+    except Exception as e:
+        print(f"Skip {f}: {e}")
+        continue
+
+    label = np.nan
+    for _, row in df.iterrows():
+        if row["filename"] in f.lower():
+            label = row["label"]
+            break
+
+    if pd.isna(label):
+        X_unknown.append(wave)
+        unknown_names.append(f)
+    else:
+        X_wave.append(wave)
+        y.append(int(label))
+
+X_wave = np.array(X_wave, dtype=np.float32)
+y      = np.array(y)
+X_unknown = np.array(X_unknown, dtype=np.float32) if X_unknown else np.array([], dtype=np.float32)
+
+print(f"Labeled samples = {len(y)}")
+print(f"Unknown samples = {len(X_unknown)}")
+print(f"Earthquake = {(y==0).sum()} | Explosion = {(y==1).sum()}")
+
+# ============================================================
+# 5-Fold Stratified Cross-Validation
+# ============================================================
+skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+
+fold_results = []
+all_fold_prob = np.zeros(len(y))
+all_fold_pred = np.zeros(len(y), dtype=int)
+
+# Save models and scalers for unknown ensemble
+fold_models = []
+fold_scalers = []
+fold_importances = []
+
+param_grid = {
+    'C':      [0.1, 1, 10, 50, 100],
+    'gamma':  ['scale', 'auto', 0.001, 0.01, 0.1],
+    'kernel': ['rbf']
+}
+inner_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+
+fold_idx = 0
+for train_idx, test_idx in skf.split(X_wave, y):
+    fold_idx += 1
+    print(f"\n{'='*60}")
+    print(f"FOLD {fold_idx}/{N_FOLDS}")
+    print(f"{'='*60}")
+    print(f"Train events = {len(train_idx)} | Test events = {len(test_idx)}")
+    print(f"Train: EQ={(y[train_idx]==0).sum()} EX={(y[train_idx]==1).sum()}")
+    print(f"Test:  EQ={(y[test_idx]==0).sum()}  EX={(y[test_idx]==1).sum()}")
+
+    X_train_wave = X_wave[train_idx]
+    X_test_wave  = X_wave[test_idx]
+    y_train      = y[train_idx]
+    y_test       = y[test_idx]
+
+    # ---- Train augmentation + feature extraction ----
+    print("--- Train: sliding window augmentation + feature extraction ---")
+    X_train_feat_list = []
+    y_train_aug_list = []
+
+    eq_count = int((y_train == 0).sum())
+    ex_count = int((y_train == 1).sum())
+    minority_class  = 0 if eq_count < ex_count else 1
+    majority_class  = 1 - minority_class
+    minority_idx    = np.where(y_train == minority_class)[0]
+    majority_idx    = np.where(y_train == majority_class)[0]
+
+    for i in minority_idx:
+        wave = X_train_wave[i]
+        windows = sliding_windows(wave)
+        for ww in windows:
+            X_train_feat_list.append(extract_features(ww, fs=FIXED_FS))
+            y_train_aug_list.append(minority_class)
+            aug1 = augment_wave_light(ww)
+            X_train_feat_list.append(extract_features(aug1, fs=FIXED_FS))
+            y_train_aug_list.append(minority_class)
+            aug2 = augment_wave_amplitude_shift(ww)
+            X_train_feat_list.append(extract_features(aug2, fs=FIXED_FS))
+            y_train_aug_list.append(minority_class)
+
+    for i in majority_idx:
+        wave = X_train_wave[i]
+        windows = sliding_windows(wave)
+        for ww in windows[:3]:
+            X_train_feat_list.append(extract_features(ww, fs=FIXED_FS))
+            y_train_aug_list.append(majority_class)
+            aug = augment_wave_amplitude_shift(ww)
+            X_train_feat_list.append(extract_features(aug, fs=FIXED_FS))
+            y_train_aug_list.append(majority_class)
+
+    X_train_feat = np.array(X_train_feat_list, dtype=np.float64)
+    y_train_aug  = np.array(y_train_aug_list)
+
+    perm = np.random.permutation(len(y_train_aug))
+    X_train_feat = X_train_feat[perm]
+    y_train_aug  = y_train_aug[perm]
+
+    # ---- Test: center window only + feature extraction ----
+    print("--- Test: center window only + feature extraction ---")
+    X_test_feat_list = []
+    for i in range(len(X_test_wave)):
+        cw = center_window(X_test_wave[i])
+        X_test_feat_list.append(extract_features(cw, fs=FIXED_FS))
+    X_test_feat = np.array(X_test_feat_list, dtype=np.float64)
+
+    # ---- Handle NaN / Inf ----
+    X_train_feat = np.nan_to_num(X_train_feat, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test_feat  = np.nan_to_num(X_test_feat,  nan=0.0, posinf=0.0, neginf=0.0)
+
+    # ---- Feature Scaling ----
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_feat)
+    X_test_scaled  = scaler.transform(X_test_feat)
+
+    # ---- GridSearchCV + SVM ----
+    print("--- GridSearchCV + SVM ---")
+    svm = SVC(probability=True, random_state=SEED)
+    grid_search = GridSearchCV(
+        estimator=svm,
+        param_grid=param_grid,
+        cv=inner_cv,
+        scoring='f1',
+        n_jobs=-1,
+        verbose=0
+    )
+    grid_search.fit(X_train_scaled, y_train_aug)
+    best_svm = grid_search.best_estimator_
+    print(f"Best params: {grid_search.best_params_}")
+
+    # ---- Evaluate fold ----
+    test_prob = best_svm.predict_proba(X_test_scaled)[:, 1]
+    
+    fpr, tpr, thresholds = roc_curve(y_test, test_prob)
+    j_scores = tpr - fpr
+    best_idx = np.argmax(j_scores)
+    optimal_threshold = thresholds[best_idx]
+    
+    test_pred = (test_prob > optimal_threshold).astype(int)
+
+    acc = accuracy_score(y_test, test_pred)
+    f1  = f1_score(y_test, test_pred)
+    roc_auc_val = auc(fpr, tpr)
+
+    all_fold_prob[test_idx] = test_prob
+    all_fold_pred[test_idx] = test_pred
+
+    print(f"Fold {fold_idx} Results:")
+    print(f"  Threshold = {optimal_threshold:.4f}")
+    print(f"  Accuracy  = {acc:.4f}")
+    print(f"  AUC       = {roc_auc_val:.4f}")
+    print(f"  F1 Score  = {f1:.4f}")
+
+    # Permutation importance (computed on test set)
+    print("  Computing permutation importance...")
+    perm_result = permutation_importance(
+        best_svm, X_test_scaled, y_test,
+        n_repeats=10, random_state=SEED, scoring='f1', n_jobs=-1
+    )
+    
+    fold_results.append({
+        'fold': fold_idx,
+        'threshold': optimal_threshold,
+        'accuracy': acc,
+        'auc': roc_auc_val,
+        'f1': f1,
+        'best_params': grid_search.best_params_
+    })
+    
+    fold_models.append(best_svm)
+    fold_scalers.append(scaler)
+    fold_importances.append(perm_result.importances_mean)
+
+# ============================================================
+# Aggregate 5-Fold Results
+# ============================================================
+print("\n" + "="*60)
+print("5-Fold Cross-Validation Summary")
+print("="*60)
+
+accs = [r['accuracy'] for r in fold_results]
+aucs = [r['auc']      for r in fold_results]
+f1s  = [r['f1']       for r in fold_results]
+
+print(f"Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+print(f"AUC:      {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
+print(f"F1 Score: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+print("\nPer-fold details:")
+for r in fold_results:
+    print(f"  Fold {r['fold']}: Acc={r['accuracy']:.4f}, "
+          f"AUC={r['auc']:.4f}, F1={r['f1']:.4f}, thr={r['threshold']:.4f}")
+
+# Pooled (out-of-fold) metrics
+overall_acc = accuracy_score(y, all_fold_pred)
+overall_f1  = f1_score(y, all_fold_pred)
+fpr_all, tpr_all, _ = roc_curve(y, all_fold_prob)
+overall_auc = auc(fpr_all, tpr_all)
+
+print(f"\nPooled (out-of-fold) metrics:")
+print(f"  Accuracy  = {overall_acc:.4f}")
+print(f"  AUC       = {overall_auc:.4f}")
+print(f"  F1 Score  = {overall_f1:.4f}")
+print("\nPooled Classification Report:")
+print(classification_report(y, all_fold_pred, target_names=["Earthquake","Explosion"]))
+
+# ============================================================
+# Pooled Confusion Matrix & ROC
+# ============================================================
+cm = confusion_matrix(y, all_fold_pred)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=["Earthquake", "Explosion"],
+            yticklabels=["Earthquake", "Explosion"])
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("SVM Confusion Matrix (5-Fold Pooled)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_FOLDER, "svm_confusion_matrix_pooled.png"), dpi=300)
+plt.close()
+
+plt.figure(figsize=(6, 5))
+plt.plot(fpr_all, tpr_all, lw=2, label=f"Pooled AUC = {overall_auc:.3f}")
+plt.plot([0, 1], [0, 1], '--', color='gray')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve (SVM, 5-Fold Pooled)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_FOLDER, "svm_roc_curve_pooled.png"), dpi=300)
+plt.close()
+
+# ============================================================
+# Per-Fold Metrics Bar Plot
+# ============================================================
+fig, ax = plt.subplots(figsize=(8, 5))
+x_pos = np.arange(N_FOLDS)
+width = 0.25
+ax.bar(x_pos - width, accs, width, label='Accuracy')
+ax.bar(x_pos,        aucs, width, label='AUC')
+ax.bar(x_pos + width, f1s,  width, label='F1 Score')
+ax.set_xticks(x_pos)
+ax.set_xticklabels([f"Fold {i+1}" for i in range(N_FOLDS)])
+ax.set_ylabel("Score")
+ax.set_title("Per-Fold Metrics (SVM)")
+ax.legend()
+ax.set_ylim(0, 1.05)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_FOLDER, "svm_per_fold_metrics.png"), dpi=300)
+plt.close()
+
+# ============================================================
+# Feature Importance (Averaged across 5 folds)
+# ============================================================
+print("\n--- SVM Averaged Permutation Feature Importance ---")
+
+feat_names = get_feature_names()
+avg_imp_vals = np.mean(fold_importances, axis=0)
+
+imp_df = pd.DataFrame({
+    'Feature':    feat_names,
+    'Importance': avg_imp_vals
+}).sort_values('Importance', ascending=False)
+
+imp_df.to_csv(os.path.join(OUTPUT_FOLDER, "svm_feature_importance.csv"),
+              index=False, encoding='utf-8-sig')
+
+top_n = 20
+plt.figure(figsize=(10, 8))
+top = imp_df.head(top_n)
+plt.barh(range(top_n), top['Importance'].values[::-1], color='steelblue')
+plt.yticks(range(top_n), top['Feature'].values[::-1])
+plt.xlabel('Averaged Permutation Importance (F1 drop)')
+plt.title(f'Top {top_n} Feature Importances (SVM 5-Fold Average)')
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_FOLDER, "svm_feature_importance.png"), dpi=300)
+plt.close()
+
+print(f"\nTop {top_n} Features:")
+for _, row in imp_df.head(top_n).iterrows():
+    print(f"  {row['Feature']:30s}  {row['Importance']:.4f}")
+
+# ============================================================
+# Unknown Prediction - Ensemble of 5 Folds
+# ============================================================
+if len(X_unknown) > 0:
+    print("\nPredicting unknown samples (ensemble of 5 folds)...")
+    X_unk_feat_list = []
+    for wave in X_unknown:
+        cw = center_window(wave)
+        X_unk_feat_list.append(extract_features(cw, fs=FIXED_FS))
+
+    X_unk_feat = np.array(X_unk_feat_list, dtype=np.float64)
+    X_unk_feat = np.nan_to_num(X_unk_feat, nan=0.0, posinf=0.0, neginf=0.0)
+
+    unk_probs = np.zeros(len(X_unknown))
+    for model, scaler in zip(fold_models, fold_scalers):
+        X_unk_scaled = scaler.transform(X_unk_feat)
+        unk_probs += model.predict_proba(X_unk_scaled)[:, 1]
+    unk_probs /= N_FOLDS
+
+    mean_threshold = float(np.mean([r['threshold'] for r in fold_results]))
+    print(f"Mean threshold across folds = {mean_threshold:.4f}")
+
+    unk_pred = (unk_probs > mean_threshold).astype(int)
+    unk_conf = np.abs(unk_probs - 0.5) * 2
+
+    pred_df = pd.DataFrame({
+        "File_Name":       unknown_names,
+        "Probability":     unk_probs,
+        "Confidence":      unk_conf,
+        "Predicted_Label": unk_pred
+    })
+    pred_df["Classification"] = pred_df["Predicted_Label"].map({0:"Earthquake",1:"Explosion"})
+    pred_df.to_csv(os.path.join(OUTPUT_FOLDER, "svm_predictions.csv"),
+                   index=False, encoding='utf-8-sig')
+
+    print("\nUnknown Sample Predictions:")
+    for _, row in pred_df.iterrows():
+        print(f"  {row['File_Name']}: {row['Classification']} "
+              f"(prob={row['Probability']:.4f}, conf={row['Confidence']:.4f})")
+
+# ============================================================
+# Summary
+# ============================================================
+with open(os.path.join(OUTPUT_FOLDER, "svm_summary.txt"), "w", encoding='utf-8') as f:
+    f.write("Earthquake / Explosion Classification: SVM (5-Fold CV)\n")
+    f.write("=" * 60 + "\n")
+    f.write(f"Model: SVM (RBF kernel)\n")
+    f.write(f"Sampling Rate: {FIXED_FS} Hz (HHZ Channel)\n")
+    f.write(f"Number of features: {X_train_feat.shape[1]}\n")
+    f.write(f"Folds: {N_FOLDS}\n\n")
+    f.write("5-Fold CV Results:\n")
+    for r in fold_results:
+        f.write(f"  Fold {r['fold']}: Acc={r['accuracy']:.4f}, "
+                f"AUC={r['auc']:.4f}, F1={r['f1']:.4f}, "
+                f"thr={r['threshold']:.4f}\n")
+        f.write(f"    Best params: {r['best_params']}\n")
+    f.write(f"\nMean Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}\n")
+    f.write(f"Mean AUC:      {np.mean(aucs):.4f} ± {np.std(aucs):.4f}\n")
+    f.write(f"Mean F1 Score: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}\n\n")
+    f.write(f"Pooled OOF Accuracy: {overall_acc:.4f}\n")
+    f.write(f"Pooled OOF AUC:      {overall_auc:.4f}\n")
+    f.write(f"Pooled OOF F1 Score: {overall_f1:.4f}\n")
+
+print("\nAll processes finished successfully!")
+print(f"Results saved to: {OUTPUT_FOLDER}")
