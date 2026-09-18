@@ -12,13 +12,15 @@ pip install -r requirements.txt
 
 Main packages:
 
-- python >=3.9
+- python >=3.12
 - numpy
 - obspy
 - tensorflow
 - scikit-learn
 - scipy
 - matplotlib
+- pandas
+- seaborn
 
 ## Project Structure
 
